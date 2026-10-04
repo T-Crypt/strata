@@ -429,6 +429,27 @@ def call_end(text: str) -> int:
             return text.find(CALL_END, pos)
 
 
+def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
+    """OpenAI's `tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
+    There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
+    "required": any of the tools; {"type": "function", "function": {"name": N}}: that one.  Other values
+    are refused (400) rather than silently ignored; "none" is handled by the caller (no tools offered)."""
+    if tool_choice in (None, "auto", "none"):
+        return None
+    names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
+    if tool_choice == "required":
+        if not names:
+            raise ValueError('tool_choice "required" needs tools')
+        return CALL_START + "\n<function="
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        name = (tool_choice.get("function") or {}).get("name")
+        if not name or name not in names:
+            raise ValueError(f"tool_choice names the function {name!r}, which is not one of the request's tools")
+        return CALL_START + f"\n<function={name}>\n"
+    raise ValueError(f"tool_choice {json.dumps(tool_choice)} is not supported here: \"auto\", \"required\" or "
+                     "{\"type\": \"function\", \"function\": {\"name\": ...}}")
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
@@ -598,14 +619,48 @@ class OutputParser:
                     best = max(best, n)
         return best
 
+    def _follower(self, pos: int) -> bool | None:
+        """What follows the CALL_START at `pos`: True when it is `<function=` (after whitespace), as the chat
+        template writes a call - a real call; False when it is anything else, so the tag is prose that names the
+        format ("I'll use a <tool_call> block") and is text, not a malformed call that ends the request; None when
+        its follower has not arrived yet, so the tag is held, like a partial tag."""
+        after = self.buf[pos + len(CALL_START):].lstrip()
+        if not after:
+            return None
+        if after.startswith(FUNC_START):
+            return True
+        if FUNC_START.startswith(after):
+            return None
+        return False
+
     def feed(self, delta: str) -> list[Event]:
         self.buf += delta
         out: list[Event] = []
         while True:
             if self.state == "reasoning":
                 i = self.buf.find(THINK_END)
+                tool = self.buf.find(CALL_START)
+                if tool >= 0 and (i < 0 or tool < i):
+                    follower = self._follower(tool)
+                    if follower is None:
+                        if tool:
+                            out.append(Event("reasoning", self.buf[:tool]))
+                            self.buf = self.buf[tool:]
+                        return out
+                    if not follower:
+                        # The same guard as the content branch: inside reasoning a bare <tool_call> is prose naming the
+                        # format, so it stays reasoning text and the call that follows is still parsed.
+                        out.append(Event("reasoning", self.buf[:tool + len(CALL_START)]))
+                        self.buf = self.buf[tool + len(CALL_START):]
+                        continue
+                    if tool:
+                        out.append(Event("reasoning", self.buf[:tool]))
+                    self.buf = self.buf[tool + len(CALL_START):]
+                    self.call_return_state = "reasoning"
+                    self.state = "call"
+                    continue
                 if i < 0:
-                    keep = self._hold(self.buf, (THINK_END,))
+                    keep = self._hold(self.buf, (THINK_END, CALL_START))
                     if len(self.buf) > keep:
                         out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
                         self.buf = self.buf[len(self.buf) - keep:]
@@ -632,15 +687,21 @@ class OutputParser:
                         out.append(Event("content", self.buf[:j]))
                         self.buf = self.buf[j:]
                     return out
-                # A call is `<tool_call>` and then (after whitespace) `<function=`; the tag with anything else after
-                # it is prose that names the format ("I'll use a <tool_call> block") - content, not a malformed call
-                # that ends the request.  Until its follower has arrived it is held, like a partial tag.
-                after = self.buf[i + len(CALL_START):].lstrip()
-                if after and not after.startswith(FUNC_START) and not FUNC_START.startswith(after):
+                # A call is `<tool_call>` and then (after whitespace) `<function=` (see _follower); the tag with anything
+                # else after it is prose that names the format - content, not a malformed call that ends the request.
+                follower = self._follower(i)
+                if follower is None:
+                    j = i
+                    while j > 0 and self.buf[j - 1] == "\n":
+                        j -= 1
+                    if j > 0:
+                        out.append(Event("content", self.buf[:j]))
+                        self.buf = self.buf[j:]
+                    return out
+                if not follower:
                     out.append(Event("content", self.buf[:i + len(CALL_START)]))
                     self.buf = self.buf[i + len(CALL_START):]
                     continue
-                if not after.startswith(FUNC_START):
                     j = i
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
@@ -651,6 +712,7 @@ class OutputParser:
                 if i and self.buf[:i].strip():
                     out.append(Event("content", self.buf[:i].rstrip("\n")))
                 self.buf = self.buf[i + len(CALL_START):]
+                self.call_return_state = "content"
                 self.state = "call"
             else:
                 i = call_end(self.buf)
@@ -672,7 +734,8 @@ class OutputParser:
                     call.id = self.scall.id
                 out.append(Event("tool_call", call=call))
                 self._reset_scan()
-                self.state, self.lead = "content", True
+                self.state = self.call_return_state
+                self.lead = self.state == "content"
 
     def finish(self) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
@@ -686,7 +749,7 @@ class OutputParser:
             self._reset_scan()
             return out
         if self.buf:
-            kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
+            kind = self.call_return_state if self.state == "call" else self.state
             text = self.buf if self.state != "call" else CALL_START + self.buf
             out.append(Event(kind, text))
             self.buf = ""
