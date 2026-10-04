@@ -619,6 +619,20 @@ class OutputParser:
                     best = max(best, n)
         return best
 
+    def _follower(self, pos: int) -> bool | None:
+        """What follows the CALL_START at `pos`: True when it is `<function=` (after whitespace), as the chat
+        template writes a call - a real call; False when it is anything else, so the tag is prose that names the
+        format ("I'll use a <tool_call> block") and is text, not a malformed call that ends the request; None when
+        its follower has not arrived yet, so the tag is held, like a partial tag."""
+        after = self.buf[pos + len(CALL_START):].lstrip()
+        if not after:
+            return None
+        if after.startswith(FUNC_START):
+            return True
+        if FUNC_START.startswith(after):
+            return None
+        return False
+
     def feed(self, delta: str) -> list[Event]:
         self.buf += delta
         out: list[Event] = []
@@ -627,6 +641,18 @@ class OutputParser:
                 i = self.buf.find(THINK_END)
                 tool = self.buf.find(CALL_START)
                 if tool >= 0 and (i < 0 or tool < i):
+                    follower = self._follower(tool)
+                    if follower is None:
+                        if tool:
+                            out.append(Event("reasoning", self.buf[:tool]))
+                            self.buf = self.buf[tool:]
+                        return out
+                    if not follower:
+                        # The same guard as the content branch: inside reasoning a bare <tool_call> is prose naming the
+                        # format, so it stays reasoning text and the call that follows is still parsed.
+                        out.append(Event("reasoning", self.buf[:tool + len(CALL_START)]))
+                        self.buf = self.buf[tool + len(CALL_START):]
+                        continue
                     if tool:
                         out.append(Event("reasoning", self.buf[:tool]))
                     self.buf = self.buf[tool + len(CALL_START):]
@@ -661,15 +687,21 @@ class OutputParser:
                         out.append(Event("content", self.buf[:j]))
                         self.buf = self.buf[j:]
                     return out
-                # A call is `<tool_call>` and then (after whitespace) `<function=`; the tag with anything else after
-                # it is prose that names the format ("I'll use a <tool_call> block") - content, not a malformed call
-                # that ends the request.  Until its follower has arrived it is held, like a partial tag.
-                after = self.buf[i + len(CALL_START):].lstrip()
-                if after and not after.startswith(FUNC_START) and not FUNC_START.startswith(after):
+                # A call is `<tool_call>` and then (after whitespace) `<function=` (see _follower); the tag with anything
+                # else after it is prose that names the format - content, not a malformed call that ends the request.
+                follower = self._follower(i)
+                if follower is None:
+                    j = i
+                    while j > 0 and self.buf[j - 1] == "\n":
+                        j -= 1
+                    if j > 0:
+                        out.append(Event("content", self.buf[:j]))
+                        self.buf = self.buf[j:]
+                    return out
+                if not follower:
                     out.append(Event("content", self.buf[:i + len(CALL_START)]))
                     self.buf = self.buf[i + len(CALL_START):]
                     continue
-                if not after.startswith(FUNC_START):
                     j = i
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
